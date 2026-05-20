@@ -6,7 +6,7 @@
 # pinning Tailscale's control-plane + DERP traffic to your physical uplink.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/<you>/tailguard/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/scrm77/tailguard/main/install.sh | sudo bash
 #   sudo ./install.sh            # install (default)
 #   sudo ./install.sh status     # show daemon + route state
 #   sudo ./install.sh uninstall  # remove everything

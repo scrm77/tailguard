@@ -14,7 +14,7 @@ It's a tiny, event-driven background daemon. Pure `bash` + built-in macOS tools.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<you>/tailguard/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/scrm77/tailguard/main/install.sh | sudo bash
 ```
 
 or clone and run:
