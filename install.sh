@@ -79,10 +79,19 @@ if [ -f "$STATE" ]; then
     done < <(netstat -rn -f inet 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1" "$2}')
 fi
 
-# 1) DERP relays — live map (no python dependency; parse JSON with grep)
-LIVE_IPS=$(curl -s --connect-timeout 5 https://controlplane.tailscale.com/derpmap/default 2>/dev/null \
-    | grep -oE '"IPv4"[[:space:]]*:[[:space:]]*"[0-9.]+"' \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+# 1) DERP relays — live map (no python dependency; parse JSON with grep).
+# Retry while the network settles: right after a network change the link and
+# gateway are up but internet/DNS isn't ready yet, so a single fetch returns
+# nothing. Without retrying, the run pins no DERP and never re-runs (no further
+# route event), stranding Tailscale until a manual toggle.
+LIVE_IPS=""
+for _ in 1 2 3 4 5 6 7 8; do
+    LIVE_IPS=$(curl -s --connect-timeout 5 https://controlplane.tailscale.com/derpmap/default 2>/dev/null \
+        | grep -oE '"IPv4"[[:space:]]*:[[:space:]]*"[0-9.]+"' \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+    [ -n "$LIVE_IPS" ] && break
+    sleep 10
+done
 
 if [ -n "$LIVE_IPS" ]; then
     derp_source="live ($(echo "$LIVE_IPS" | grep -c .) IPs)"
