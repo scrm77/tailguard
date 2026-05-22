@@ -40,6 +40,7 @@ write_fix_script() {
 # Idempotent: silent no-op when nothing needs changing. Must run as root.
 
 LOG="/var/log/tailguard.log"
+STATE="/Library/Application Support/tailguard/pinned.txt"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"; }
 
 # Resolve default gateway + interface (wait up to 15s for the network to settle)
@@ -60,6 +61,23 @@ case "$IFACE" in
         log "default on '$IFACE' (tunnel) — skipping; need a physical uplink as default"
         exit 0 ;;
 esac
+
+# --- Evict stale landmines FIRST ---
+# Any host route WE previously pinned (tracked in $STATE) that now points to a
+# gateway other than the current one is a leftover from a previous network and
+# black-holes traffic. Remove it before anything else — this runs even when the
+# DERP fetch below fails, so a network change never strands old DERP pins.
+evicted=0
+if [ -f "$STATE" ]; then
+    while read -r dest gw; do
+        [ "$gw" = "$GATEWAY" ] && continue
+        case "$dest" in [0-9]*) ;; *) continue ;; esac
+        if grep -qxF "$dest" "$STATE" 2>/dev/null; then
+            route -n delete -host "$dest" >/dev/null 2>&1
+            evicted=$((evicted + 1))
+        fi
+    done < <(netstat -rn -f inet 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1" "$2}')
+fi
 
 # 1) DERP relays — live map (no python dependency; parse JSON with grep)
 LIVE_IPS=$(curl -s --connect-timeout 5 https://controlplane.tailscale.com/derpmap/default 2>/dev/null \
@@ -97,6 +115,14 @@ for ip in "${BYPASS_HOSTS[@]}"; do
     fi
 done
 
+# Record everything we pin so a future run can evict it if it goes stale
+# (accumulate + dedupe; cap to keep the file bounded)
+if [ "${#BYPASS_HOSTS[@]}" -gt 0 ]; then
+    { cat "$STATE" 2>/dev/null; printf '%s\n' "${BYPASS_HOSTS[@]}"; } \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tail -1000 > "$STATE.tmp" \
+        && mv "$STATE.tmp" "$STATE"
+fi
+
 # Pin control-plane subnets; clear any stale /32s a VPN injected inside them
 for prefix in "${CONTROL_PREFIXES[@]}"; do
     net="${prefix%/*}"; three="${net%.*}"; esc="${three//./\\.}"
@@ -118,8 +144,8 @@ for prefix in "${CONTROL_PREFIXES[@]}"; do
 done
 
 # Log only when something actually changed
-if [ "$added" -gt 0 ] || [ "$stale_count" -gt 0 ]; then
-    log "iface=$IFACE gw=$GATEWAY derp=$derp_source control=${#CONTROL_PREFIXES[@]} | added=$added skipped=$skipped stale=$stale_count"
+if [ "$added" -gt 0 ] || [ "$stale_count" -gt 0 ] || [ "$evicted" -gt 0 ]; then
+    log "iface=$IFACE gw=$GATEWAY derp=$derp_source control=${#CONTROL_PREFIXES[@]} | added=$added skipped=$skipped stale=$stale_count evicted=$evicted"
 fi
 EOF_FIX
     chmod 755 "$FIX"
