@@ -41,6 +41,7 @@ write_fix_script() {
 
 LOG="/var/log/tailguard.log"
 STATE="/Library/Application Support/tailguard/pinned.txt"
+CACHE="/Library/Application Support/tailguard/derp-cache.txt"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"; }
 
 # Resolve default gateway + interface (wait up to 15s for the network to settle)
@@ -65,8 +66,7 @@ esac
 # --- Evict stale landmines FIRST ---
 # Any host route WE previously pinned (tracked in $STATE) that now points to a
 # gateway other than the current one is a leftover from a previous network and
-# black-holes traffic. Remove it before anything else — this runs even when the
-# DERP fetch below fails, so a network change never strands old DERP pins.
+# black-holes traffic. Remove it before anything else.
 evicted=0
 if [ -f "$STATE" ]; then
     while read -r dest gw; do
@@ -79,26 +79,22 @@ if [ -f "$STATE" ]; then
     done < <(netstat -rn -f inet 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1" "$2}')
 fi
 
-# 1) DERP relays — live map (no python dependency; parse JSON with grep).
-# Retry while the network settles: right after a network change the link and
-# gateway are up but internet/DNS isn't ready yet, so a single fetch returns
-# nothing. Without retrying, the run pins no DERP and never re-runs (no further
-# route event), stranding Tailscale until a manual toggle.
-LIVE_IPS=""
-for _ in 1 2 3 4 5 6 7 8; do
-    LIVE_IPS=$(curl -s --connect-timeout 5 https://controlplane.tailscale.com/derpmap/default 2>/dev/null \
+# 1) DERP relays — pinned from a 24h cache. DERP IPs are stable, so caching means
+# routine/safety-net runs do NO network I/O (battery friendly) and a network
+# change re-pins instantly from cache even before the internet is back. The map
+# is (re)fetched only when the cache is missing/empty or older than a day.
+if [ ! -s "$CACHE" ] || [ "$(( $(date +%s) - $(stat -f %m "$CACHE" 2>/dev/null || echo 0) ))" -ge 86400 ]; then
+    fetched=$(curl -s --connect-timeout 5 https://controlplane.tailscale.com/derpmap/default 2>/dev/null \
         | grep -oE '"IPv4"[[:space:]]*:[[:space:]]*"[0-9.]+"' \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
-    [ -n "$LIVE_IPS" ] && break
-    sleep 10
-done
-
-if [ -n "$LIVE_IPS" ]; then
-    derp_source="live ($(echo "$LIVE_IPS" | grep -c .) IPs)"
-    BYPASS_HOSTS=($LIVE_IPS)
+    [ -n "$fetched" ] && printf '%s\n' "$fetched" > "$CACHE"
+fi
+if [ -s "$CACHE" ]; then
+    BYPASS_HOSTS=($(cat "$CACHE"))
+    derp_source="cache ($(grep -c . "$CACHE") IPs)"
 else
-    derp_source="offline"
     BYPASS_HOSTS=()
+    derp_source="none"
 fi
 
 # 2) Control-plane subnets — resolve dynamically + known Tailscale /24 baseline
@@ -165,27 +161,32 @@ write_monitor_script() {
 #!/bin/bash
 # route-monitor.sh (TailGuard) — trigger fix-routes.sh on routing changes.
 #
-# Two layers so a missed event can't strand Tailscale:
-#  1. Event-driven: `route -n monitor` gives fast reaction to routing changes.
-#  2. Periodic safety net: re-run every TICK seconds regardless, so if the
-#     route-monitor stream goes stale (e.g. after sleep/wake) a stale pin is
-#     corrected within ~TICK instead of never. fix-routes.sh is idempotent and
-#     silent when nothing changed, so periodic runs are cheap and quiet.
-# Also respawns `route -n monitor` if its stream ends.
+# Battery-friendly + robust:
+#  - Idle: blocks on `route -n monitor` (kernel wakes us only on a real routing
+#    change), with the read timeout set to BACKSTOP so a fully idle machine
+#    wakes at most once per BACKSTOP seconds.
+#  - Event-driven: routing changes fire fix-routes.sh fast (after a short
+#    debounce), so network switches recover in seconds.
+#  - Safety net: fix-routes.sh also runs every BACKSTOP seconds regardless, so a
+#    missed/stale event (e.g. route-monitor going quiet after sleep/wake) still
+#    self-corrects within ~BACKSTOP. fix-routes.sh is idempotent, silent, and
+#    does no network I/O on routine runs (DERP map is cached), so this is cheap.
+#  - Respawns `route -n monitor` if its stream ends; reaps orphaned children.
 
 FIX="/Library/Application Support/tailguard/fix-routes.sh"
 LOG="/var/log/tailguard.log"
-DEBOUNCE=2   # seconds of quiet after an event before firing
-COOLDOWN=3   # minimum seconds between consecutive fix runs
-TICK=90      # periodic safety-net interval (seconds)
+DEBOUNCE=2      # seconds of quiet after an event before firing
+COOLDOWN=3      # minimum seconds between consecutive fix runs
+BACKSTOP=300    # safety-net interval / idle wake interval (seconds)
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [monitor] $1" >> "$LOG"; }
 
-# Reap any orphaned `route -n monitor` children left behind by a previously
-# killed instance (process substitution doesn't kill its child on SIGKILL).
-# Safe: runs before we spawn our own monitor below.
-pkill -f 'route -n monitor' 2>/dev/null
-# Kill our own route-monitor child on graceful stop (SIGTERM from launchd bootout)
+# Reap orphaned `route -n monitor` children left by a previously hard-killed
+# instance — matched precisely by PPID=1 (reparented to launchd), so we never
+# touch unrelated processes. On graceful stop the trap below kills our own child.
+for _p in $(ps -ax -o pid=,ppid=,command= 2>/dev/null | awk '$2==1 && /route -n monitor/ {print $1}'); do
+    kill "$_p" 2>/dev/null
+done
 trap 'pkill -P $$ 2>/dev/null; exit 0' TERM INT
 
 last_fix=0
@@ -203,7 +204,8 @@ pending=0
 last_event=0
 while true; do                                   # outer: (re)spawn route monitor
     while true; do                               # inner: read loop
-        IFS= read -r -t 5 line
+        if [ "$pending" -eq 1 ]; then to=$DEBOUNCE; else to=$BACKSTOP; fi
+        IFS= read -r -t "$to" line
         rc=$?
         if [ "$rc" -eq 0 ]; then
             case "$line" in
@@ -215,16 +217,14 @@ while true; do                                   # outer: (re)spawn route monito
             sleep 2
             break                                # -> respawn route monitor
         fi
-        # rc > 128 == 5s read timeout: fall through and check timers
+        # rc > 128 == read timeout: fall through and check timers
 
         now=$(date +%s)
-        # event debounce: fire once the change storm has settled
         if [ "$pending" -eq 1 ] && [ $((now - last_event)) -ge "$DEBOUNCE" ]; then
             pending=0
             fire
         fi
-        # periodic safety net: fire every TICK seconds no matter what
-        if [ $((now - last_fix)) -ge "$TICK" ]; then
+        if [ $((now - last_fix)) -ge "$BACKSTOP" ]; then
             fire
         fi
     done < <(exec route -n monitor 2>/dev/null)
