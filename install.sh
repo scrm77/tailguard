@@ -97,15 +97,11 @@ else
     derp_source="none"
 fi
 
-# 2) Control-plane subnets — resolve dynamically + known Tailscale /24 baseline
-#    (192.200.0.0/24 is owned by Tailscale Inc., NetName TAILS)
+# 2) Control-plane subnet — Tailscale's own block (192.200.0.0/24, NetName TAILS;
+#    controlplane.tailscale.com and login.tailscale.com both resolve into it).
+#    Static, so this stays fully offline (no DNS lookups). If Tailscale ever
+#    moves its control-plane block, update this one line.
 CONTROL_PREFIXES=("192.200.0.0/24")
-for host in controlplane.tailscale.com login.tailscale.com; do
-    for ip in $(dig +short "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'); do
-        CONTROL_PREFIXES+=("${ip%.*}.0/24")
-    done
-done
-CONTROL_PREFIXES=($(printf '%s\n' "${CONTROL_PREFIXES[@]}" | sort -u))
 
 added=0; skipped=0; stale_count=0
 
