@@ -163,16 +163,30 @@ EOF_FIX
 write_monitor_script() {
     cat > "$MON" <<'EOF_MON'
 #!/bin/bash
-# route-monitor.sh (TailGuard) — event-driven trigger for fix-routes.sh.
-# Listens to `route -n monitor` and re-applies bypass routes only when the
-# routing table changes in a relevant way. Pure bash, no dependencies.
+# route-monitor.sh (TailGuard) — trigger fix-routes.sh on routing changes.
+#
+# Two layers so a missed event can't strand Tailscale:
+#  1. Event-driven: `route -n monitor` gives fast reaction to routing changes.
+#  2. Periodic safety net: re-run every TICK seconds regardless, so if the
+#     route-monitor stream goes stale (e.g. after sleep/wake) a stale pin is
+#     corrected within ~TICK instead of never. fix-routes.sh is idempotent and
+#     silent when nothing changed, so periodic runs are cheap and quiet.
+# Also respawns `route -n monitor` if its stream ends.
 
 FIX="/Library/Application Support/tailguard/fix-routes.sh"
 LOG="/var/log/tailguard.log"
 DEBOUNCE=2   # seconds of quiet after an event before firing
 COOLDOWN=3   # minimum seconds between consecutive fix runs
+TICK=90      # periodic safety-net interval (seconds)
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [monitor] $1" >> "$LOG"; }
+
+# Reap any orphaned `route -n monitor` children left behind by a previously
+# killed instance (process substitution doesn't kill its child on SIGKILL).
+# Safe: runs before we spawn our own monitor below.
+pkill -f 'route -n monitor' 2>/dev/null
+# Kill our own route-monitor child on graceful stop (SIGTERM from launchd bootout)
+trap 'pkill -P $$ 2>/dev/null; exit 0' TERM INT
 
 last_fix=0
 fire() {
@@ -183,28 +197,38 @@ fire() {
 }
 
 log "monitor starting"
-/bin/bash "$FIX"            # initial apply (like RunAtLoad)
-last_fix=$(date +%s)
+fire   # initial apply
 
 pending=0
-while true; do
-    if [ "$pending" -eq 1 ]; then
-        # Wait up to DEBOUNCE for the next event; timeout => storm settled, fire.
-        if IFS= read -r -t "$DEBOUNCE" line; then
-            :
-        else
+last_event=0
+while true; do                                   # outer: (re)spawn route monitor
+    while true; do                               # inner: read loop
+        IFS= read -r -t 5 line
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            case "$line" in
+                *RTM_ADD*|*RTM_CHANGE*|*RTM_DELETE*|*RTM_IFINFO*|*192.200.0.*|*default*)
+                    pending=1; last_event=$(date +%s) ;;
+            esac
+        elif [ "$rc" -le 128 ]; then
+            log "route monitor stream ended; respawning in 2s"
+            sleep 2
+            break                                # -> respawn route monitor
+        fi
+        # rc > 128 == 5s read timeout: fall through and check timers
+
+        now=$(date +%s)
+        # event debounce: fire once the change storm has settled
+        if [ "$pending" -eq 1 ] && [ $((now - last_event)) -ge "$DEBOUNCE" ]; then
             pending=0
             fire
-            continue
         fi
-    else
-        IFS= read -r line || { log "route monitor stream ended; exiting for restart"; exit 1; }
-    fi
-    case "$line" in
-        *RTM_ADD*|*RTM_CHANGE*|*RTM_DELETE*|*RTM_IFINFO*|*192.200.0.*|*default*)
-            pending=1 ;;
-    esac
-done < <(exec route -n monitor 2>/dev/null)
+        # periodic safety net: fire every TICK seconds no matter what
+        if [ $((now - last_fix)) -ge "$TICK" ]; then
+            fire
+        fi
+    done < <(exec route -n monitor 2>/dev/null)
+done
 EOF_MON
     chmod 755 "$MON"
 }
